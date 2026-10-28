@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LocalDrop</title>
+<style>
+  :root { --bg:#0b0f17; --card:#131a26; --line:#222c3d; --txt:#e6edf7; --mut:#8394ad; --acc:#4f8cff; --ok:#34d399; --bad:#f87171; }
+  * { box-sizing:border-box; margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  body { background:var(--bg); color:var(--txt); min-height:100vh; padding:20px; }
+  .wrap { max-width:720px; margin:0 auto; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:20px; margin-bottom:16px; }
+  h1 { font-size:22px; } .mut { color:var(--mut); font-size:14px; }
+  button { background:var(--acc); color:#fff; border:0; padding:12px 20px; border-radius:12px; font-size:16px; font-weight:600; cursor:pointer; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--mut); padding:8px 12px; font-size:14px; }
+  button:disabled { opacity:.5; }
+  #connect { text-align:center; padding-top:15vh; }
+  #connect h1 { font-size:32px; margin-bottom:8px; }
+  #connect button { margin-top:24px; width:100%; max-width:320px; padding:16px; }
+  #status { margin-top:16px; min-height:22px; }
+  .hidden { display:none !important; }
+  header { display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; gap:10px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--ok); margin-right:6px; }
+  #drop { border:2px dashed var(--line); border-radius:14px; padding:28px; text-align:center; cursor:pointer; transition:.15s; }
+  #drop.over { border-color:var(--acc); background:#4f8cff14; }
+  .bar { height:6px; background:var(--line); border-radius:3px; margin-top:14px; overflow:hidden; }
+  .bar > div { height:100%; width:0; background:var(--acc); transition:width .1s; }
+  .file { display:flex; align-items:center; gap:12px; padding:12px 0; border-bottom:1px solid var(--line); }
+  .file:last-child { border:0; }
+  .file .info { flex:1; min-width:0; }
+  .file .n { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .file a { color:var(--acc); text-decoration:none; font-weight:600; font-size:14px; padding:8px 12px; border:1px solid var(--line); border-radius:10px; }
+  .file .del { color:var(--bad); background:none; border:0; padding:8px; font-size:18px; cursor:pointer; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- Connect screen -->
+  <section id="connect">
+    <h1>📡 LocalDrop</h1>
+    <p class="mut">Same Wi-Fi or hotspot. No IP typing.</p>
+    <button id="scanBtn">Connect &amp; Scan</button>
+    <div id="status" class="mut"></div>
+  </section>
+
+  <!-- Dashboard -->
+  <section id="dash" class="hidden">
+    <header>
+      <div><h1>LocalDrop</h1><div class="mut"><span class="dot"></span><span id="srvName"></span></div></div>
+      <button class="ghost" id="disc">Disconnect</button>
+    </header>
+
+    <div class="card">
+      <div id="drop">
+        <div style="font-size:30px">⬆️</div>
+        <div>Tap to choose files or drop them here</div>
+        <div class="mut" id="upText"></div>
+        <div class="bar hidden" id="bar"><div></div></div>
+      </div>
+      <input type="file" id="fileInput" multiple class="hidden">
+    </div>
+
+    <div class="card">
+      <h3 style="margin-bottom:6px">Shared files</h3>
+      <div id="list"><p class="mut">No files yet.</p></div>
+    </div>
+  </section>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let BASE = '';            // server origin, e.g. http://192.168.1.5:3000
+let es = null;
+
+// ---------- discovery ----------
+async function ping(base, ms = 800) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  try {
+    const r = await fetch(base + '/api/ping', { signal: ctl.signal });
+    const j = await r.json();
+    return j.app === 'localdrop' ? j : null;
+  } catch { return null; } finally { clearTimeout(t); }
+}
+
+async function scanSubnets(onProgress) {
+  const prefixes = ['192.168.1', '192.168.0', '192.168.43', '192.168.137', '172.20.10', '192.168.2', '10.0.0', '192.168.100'];
+  const hosts = [];
+  for (const p of prefixes) for (let i = 1; i < 255; i++) hosts.push(`http://${p}.${i}:3000`);
+  let idx = 0, found = null, done = 0;
+  async function worker() {
+    while (!found && idx < hosts.length) {
+      const h = hosts[idx++];
+      const r = await ping(h, 700);
+      if (r && !found) found = { base: h, ...r };
+      onProgress(++done / hosts.length);
+    }
+  }
+  await Promise.all(Array.from({ length: 80 }, worker));
+  return found;
+}
+
+async function connectAndScan() {
+  const btn = $('scanBtn'), st = $('status');
+  btn.disabled = true;
+  try {
+    // 1) the server that served this page
+    if (location.protocol.startsWith('http')) {
+      st.textContent = 'Checking this server…';
+      const r = await ping(location.origin);
+      if (r) return enter(location.origin, r);
+    }
+    // 2) last used server
+    const saved = localStorage.getItem('ld_server');
+    if (saved) {
+      st.textContent = 'Trying last server…';
+      const r = await ping(saved, 1200);
+      if (r) return enter(saved, r);
+    }
+    // 3) scan the network
+    st.textContent = 'Scanning network… 0%';
+    const f = await scanSubnets(p => st.textContent = `Scanning network… ${Math.round(p * 100)}%`);
+    if (f) return enter(f.base, f);
+    st.innerHTML = '❌ No server found.<br>Make sure the PC app is running and both devices are on the same network.';
+  } finally { btn.disabled = false; }
+}
+
+function enter(base, info) {
+  BASE = base;
+  localStorage.setItem('ld_server', base);
+  $('srvName').textContent = `${info.name} · ${base.replace('http://', '')}`;
+  $('connect').classList.add('hidden');
+  $('dash').classList.remove('hidden');
+  loadFiles();
+  if (es) es.close();
+  es = new EventSource(BASE + '/api/events');
+  es.onmessage = loadFiles;
+}
+
+$('scanBtn').onclick = connectAndScan;
+$('disc').onclick = () => {
+  if (es) es.close();
+  localStorage.removeItem('ld_server');
+  $('dash').classList.add('hidden');
+  $('connect').classList.remove('hidden');
+  $('status').textContent = '';
+};
+
+// ---------- files ----------
+function fmtSize(b) {
+  if (b < 1024) return b + ' B';
+  const u = ['KB', 'MB', 'GB', 'TB']; let i = -1;
+  do { b /= 1024; i++; } while (b >= 1024 && i < 3);
+  return b.toFixed(1) + ' ' + u[i];
+}
+
+async function loadFiles() {
+  try {
+    const files = await (await fetch(BASE + '/api/files')).json();
+    const list = $('list');
+    list.innerHTML = '';
+    if (!files.length) { list.innerHTML = '<p class="mut">No files yet.</p>'; return; }
+    for (const f of files) {
+      const row = document.createElement('div'); row.className = 'file';
+      const info = document.createElement('div'); info.className = 'info';
+      const n = document.createElement('div'); n.className = 'n'; n.textContent = f.name;
+      const m = document.createElement('div'); m.className = 'mut';
+      m.textContent = `${fmtSize(f.size)} · ${new Date(f.time).toLocaleString()}`;
+      info.append(n, m);
+      const a = document.createElement('a');
+      a.href = `${BASE}/download/${encodeURIComponent(f.name)}`; a.textContent = 'Download';
+      const d = document.createElement('button'); d.className = 'del'; d.textContent = '🗑'; d.title = 'Delete';
+      d.onclick = async () => {
+        if (confirm(`Delete "${f.name}"?`)) await fetch(`${BASE}/api/files/${encodeURIComponent(f.name)}`, { method: 'DELETE' });
+      };
+      row.append(info, a, d);
+      list.append(row);
+    }
+  } catch { /* server may be offline */ }
+}
+
+// ---------- upload ----------
+function upload(files) {
+  if (!files.length) return;
+  const fd = new FormData();
+  for (const f of files) fd.append('files', f);
+  const xhr = new XMLHttpRequest();
+  const bar = $('bar'), fill = bar.firstElementChild;
+  bar.classList.remove('hidden');
+  $('upText').textContent = `Uploading ${files.length} file(s)…`;
+  xhr.upload.onprogress = e => { if (e.lengthComputable) fill.style.width = (e.loaded / e.total * 100) + '%'; };
+  xhr.onload = () => {
+    $('upText').textContent = xhr.status === 200 ? '✅ Upload complete' : '❌ Upload failed';
+    setTimeout(() => { bar.classList.add('hidden'); fill.style.width = 0; $('upText').textContent = ''; }, 2000);
+    loadFiles();
+  };
+  xhr.onerror = () => { $('upText').textContent = '❌ Connection lost'; };
+  xhr.open('POST', BASE + '/api/upload');
+  xhr.send(fd);
+}
+
+const drop = $('drop'), input = $('fileInput');
+drop.onclick = () => input.click();
+input.onchange = () => { upload([...input.files]); input.value = ''; };
+['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => upload([...e.dataTransfer.files]));
+
+// auto-reconnect when opened from the server itself
+if (location.protocol.startsWith('http')) connectAndScan();
+</script>
+</body>
+</html>
